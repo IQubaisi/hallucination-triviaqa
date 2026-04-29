@@ -1,0 +1,1311 @@
+# Cell 1
+# Install required libraries
+!pip install transformers datasets accelerate bitsandbytes pyserini torch pillow==10.4.0 -q
+
+# Verify GPU
+import torch
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0))
+
+============================================================
+
+# Cell 2
+import json
+from google.colab import drive
+import os
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Create project folder
+os.makedirs('/content/drive/MyDrive/hallucination_project', exist_ok=True)
+print("Drive mounted. Project folder ready.")
+
+============================================================
+
+# Cell 3
+# Authenticate with HuggingFace
+from huggingface_hub import login
+from google.colab import userdata
+
+login(token=userdata.get('HF_TOKEN'))
+
+============================================================
+
+# Cell 5
+from datasets import load_dataset
+
+# Load TriviaQA RC (Reading Comprehension) split - full validation set
+# RC split includes evidence passages, required for RAG configuration
+# Validation set used because test labels are not publicly available
+
+dataset = load_dataset("trivia_qa", "rc", split="validation")
+
+print(f"Total questions: {len(dataset)}")
+print(f"\nExample question: {dataset[0]['question']}")
+print(f"Example answer: {dataset[0]['answer']['value']}")
+print(f"Example aliases: {dataset[0]['answer']['aliases'][:5]}")
+
+============================================================
+
+# Cell 7
+# Load Llama-3.2-3B-Instruct as the samller basline model
+# float16 precision halves memory usage
+# devic_map='auto' places model on GPU automatically
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+model_name = "meta-llama/Llama-3.2-3B-Instruct"
+
+print("loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left" # Required for correct batch generation
+
+print("loading model...")
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,  # Half precision to reduce memory footprint
+    device_map="auto"           # Automatically maps layers to available GPU
+)
+model.eval() #disable dropout for deterministic inference
+print("Model loaded successfully")
+print(f"Device: {next(model.parameters()).device}")
+
+============================================================
+
+# Cell 9
+# Define all 4 prompt configurations used in this study.
+# A single batched inference function handles all configurations
+# for efficiency across 17,944 questions.
+
+# Config 1: Closed-book, neutral prompt
+# Model answers purely from parametric memory, no guidance on uncertainty
+PROMPT_CONFIG_1 = """Answer the following question in a few words.
+
+Question: {question}
+Answer:"""
+
+# Config 2: Closed-book with abstention prompt
+# Model is explicitly instructed to abstain if uncertain
+# Tests whether uncertainty instruction reduces hallucination rate
+PROMPT_CONFIG_2 = """Answer the following question in a few words.
+If you are not sure of the answer, say "I don't know".
+
+Question: {question}
+Answer:"""
+
+# Config 3: RAG with BM25 retrieval
+# Model is grounded with a retrieved evidence passage
+# Tests whether external grounding reduces hallucination
+PROMPT_CONFIG_3 = """Use the following passage to answer the question in a few words.
+
+Passage: {context}
+
+Question: {question}
+Answer:"""
+
+# Config 4: Calibrated confidence prompting
+# Model states confidence before answering, then flags uncertainty after
+# Enables novel analysis of confident-but-wrong hallucination pattern
+PROMPT_CONFIG_4 = """Before answering, rate your confidence as High, Medium, or Low.
+Then answer the question in a few words.
+If your confidence is Low, add "I am not certain" after your answer.
+
+Question: {question}
+Confidence:"""
+
+============================================================
+
+# Cell 11
+# Single reusable inference function used across all 4 configurations
+# and both models. Batched for efficiency across 17,944 questions.
+
+def run_inference(model, tokenizer, prompts, batch_size=16, max_new_tokens=50):
+    """
+    Run batched inference over a list of prompts.
+
+    Args:
+        model: loaded HuggingFace causal LM
+        tokenizer: corresponding tokenizer
+        prompts: list of formatted prompt strings
+        batch_size: number of prompts per batch (16 fits A100 40GB)
+        max_new_tokens: max tokens to generate per answer (50 sufficient for QA)
+
+    Returns:
+        list of generated answer strings
+    """
+    all_outputs = []
+
+    for i in range(0, len(prompts), batch_size):
+        batch = prompts[i:i + batch_size]
+
+        # Tokenize batch with padding and truncation
+        inputs = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,        # Greedy decoding for reproducibility
+                temperature=1.0,
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+        # Decode only newly generated tokens, not the prompt
+        for j, output in enumerate(outputs):
+            input_len = inputs["input_ids"][j].shape[0]
+            generated = tokenizer.decode(
+                output[input_len:],
+                skip_special_tokens=True
+            ).strip()
+            all_outputs.append(generated)
+
+        # Progress update every ~500 questions
+        if (i // batch_size) % 31 == 0:
+            print(f"Processed {min(i + batch_size, len(prompts))}/{len(prompts)} questions")
+
+    return all_outputs
+
+============================================================
+
+# Cell 13
+# Baseline configuration: model answers from parametric memory only.
+# No retrieval, no uncertainty instruction. Establishes hallucination
+# floor rate before any intervention is applied.
+
+import time
+
+# Format all prompts for Config 1
+prompts_config1 = [
+    PROMPT_CONFIG_1.format(question=example["question"])
+    for example in dataset
+]
+
+print(f"Total prompts prepared: {len(prompts_config1)}")
+print(f"\nSample prompt:\n{prompts_config1[0]}")
+
+# Run inference
+print("\nRunning Config 1 inference (3B model)...")
+start = time.time()
+results_config1_3b = run_inference(model, tokenizer, prompts_config1)
+elapsed = time.time() - start
+
+print(f"\nInference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config1_3b[0]}")
+
+============================================================
+
+# Cell 15
+# Save all inference results to Google Drive immediately after each run.
+# This prevents data loss if Colab session disconnects or times out.
+# Save Config 1 3B results
+
+with open('/content/drive/MyDrive/hallucination_project/results_config1_3b.json', 'w') as f:
+    json.dump(results_config1_3b, f)
+
+print(f"Saved {len(results_config1_3b)} results to Google Drive")
+print("Path: /content/drive/MyDrive/hallucination_project/results_config1_3b.json")
+
+============================================================
+
+# Cell 17
+# Same closed-book setting as Config 1 but model is explicitly instructed
+# to say "I don't know" when uncertain. Tests whether abstention instruction
+# reduces hallucination rate compared to the neutral baseline.
+
+# Format all prompts for Config 2
+prompts_config2 = [
+    PROMPT_CONFIG_2.format(question=example["question"])
+    for example in dataset
+]
+
+print(f"Total prompts prepared: {len(prompts_config2)}")
+print(f"\nSample prompt:\n{prompts_config2[0]}")
+
+# Run inference
+print("\nRunning Config 2 inference (3B model)...")
+start = time.time()
+results_config2_3b = run_inference(model, tokenizer, prompts_config2)
+elapsed = time.time() - start
+
+print(f"\nInference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config2_3b[0]}")
+
+============================================================
+
+# Cell 18
+# Save Config 2 3B results
+with open('/content/drive/MyDrive/hallucination_project/results_config2_3b.json', 'w') as f:
+    json.dump(results_config2_3b, f)
+
+print(f"Saved {len(results_config2_3b)} results to Google Drive")
+print("Path: /content/drive/MyDrive/hallucination_project/results_config2_3b.json")
+
+============================================================
+
+# Cell 20
+# Novel configuration: model explicitly states confidence level before
+# answering. Enables analysis of calibration — whether expressed confidence
+# correlates with factual correctness. Identifies "confident-but-wrong"
+# hallucination pattern, a key contribution of this study.
+
+# Format all prompts for Config 4
+prompts_config4 = [
+    PROMPT_CONFIG_4.format(question=example["question"])
+    for example in dataset
+]
+
+print(f"Total prompts prepared: {len(prompts_config4)}")
+print(f"\nSample prompt:\n{prompts_config4[0]}")
+
+# Run inference
+print("\nRunning Config 4 inference (3B model)...")
+start = time.time()
+results_config4_3b = run_inference(model, tokenizer, prompts_config4)
+elapsed = time.time() - start
+
+print(f"\nInference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config4_3b[0]}")
+
+============================================================
+
+# Cell 21
+# Save Config 4 3B results
+with open('/content/drive/MyDrive/hallucination_project/results_config4_3b.json', 'w') as f:
+    json.dump(results_config4_3b, f)
+
+print(f"Saved {len(results_config4_3b)} results to Google Drive")
+print("Path: /content/drive/MyDrive/hallucination_project/results_config4_3b.json")
+
+============================================================
+
+# Cell 23
+# Free 3B model from GPU memory before loading 8B model.
+# Both models cannot fit in 40GB VRAM simultaneously.
+# 8B model in float16 uses ~16GB VRAM, well within A100 limit.
+
+import gc
+
+# Delete 3B model and free GPU memory
+del model
+del tokenizer
+gc.collect()
+torch.cuda.empty_cache()
+print(f"GPU memory freed. Available: {torch.cuda.mem_get_info()[0]/1e9:.1f} GB")
+
+# Load 8B model
+model_name = "meta-llama/Llama-3.1-8B-Instruct"
+
+print("\nLoading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
+
+print("Loading model...")
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.float16,
+    device_map="auto"
+)
+model.eval()
+print("8B model loaded successfully")
+print(f"Device: {next(model.parameters()).device}")
+
+============================================================
+
+# Cell 25
+# Repeat Config 1 with the larger 8B model. Same prompt, same dataset.
+# Enables direct size comparison: does a larger model hallucinate less
+# when answering purely from parametric memory?
+
+print("Running Config 1 inference (8B model)...")
+start = time.time()
+results_config1_8b = run_inference(model, tokenizer, prompts_config1)
+elapsed = time.time() - start
+
+print(f"\nInference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config1_8b[0]}")
+
+============================================================
+
+# Cell 26
+# Save Config 1 8B results
+with open('/content/drive/MyDrive/hallucination_project/results_config1_8b.json', 'w') as f:
+    json.dump(results_config1_8b, f)
+
+print(f"Saved {len(results_config1_8b)} results to Google Drive")
+print("Path: /content/drive/MyDrive/hallucination_project/results_config1_8b.json")
+
+============================================================
+
+# Cell 28
+# Repeat Config 2 with the larger 8B model. Tests whether the larger
+# model is better calibrated to abstain when uncertain compared to 3B.
+
+print("Running Config 2 inference (8B model)...")
+start = time.time()
+results_config2_8b = run_inference(model, tokenizer, prompts_config2)
+elapsed = time.time() - start
+
+print(f"\nInference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config2_8b[0]}")
+
+============================================================
+
+# Cell 29
+# Save Config 2 8B results
+with open('/content/drive/MyDrive/hallucination_project/results_config2_8b.json', 'w') as f:
+    json.dump(results_config2_8b, f)
+
+print(f"Saved {len(results_config2_8b)} results to Google Drive")
+print("Path: /content/drive/MyDrive/hallucination_project/results_config2_8b.json")
+
+============================================================
+
+# Cell 32
+# Repeat Config 4 with the larger 8B model. Tests whether the larger
+# model is better calibrated — does it express appropriate confidence
+# levels that correlate with factual correctness?
+
+print("Running Config 4 inference (8B model)...")
+start = time.time()
+results_config4_8b = run_inference(model, tokenizer, prompts_config4)
+elapsed = time.time() - start
+
+print(f"\nInference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config4_8b[0]}")
+
+============================================================
+
+# Cell 33
+# Save Config 4 8B results
+with open('/content/drive/MyDrive/hallucination_project/results_config4_8b.json', 'w') as f:
+    json.dump(results_config4_8b, f)
+
+print(f"Saved {len(results_config4_8b)} results to Google Drive")
+print("Path: /content/drive/MyDrive/hallucination_project/results_config4_8b.json")
+
+============================================================
+
+# Cell 34
+# Push all results to GitHub
+!cp "/content/drive/MyDrive/Colab Notebooks/hallucination_triviaqa.ipynb" /content/hallucination_triviaqa.ipynb
+!cp /content/drive/MyDrive/hallucination_project/*.json /content/
+!git add /content/hallucination_triviaqa.ipynb
+!git add /content/*.json
+!git commit -m "Add Config 4 8B results - all non-RAG configs complete"
+!git push origin main
+
+============================================================
+
+# Cell 36
+!pip install rank-bm25 -q
+from rank_bm25 import BM25Okapi
+import numpy as np
+
+# FIX: Old code retrieved per-question inside the prompt loop, causing
+# 17,944 x 17,944 BM25 operations and a multi-hour hang.
+# New approach: build one shared corpus (one passage per question),
+# pre-compute all retrievals here, store in retrieved_passages.
+# Cell 40 then does pure string formatting — zero BM25 calls.
+
+# Build corpus: one passage per question, fallback to question text if none
+corpus_passages = []
+for example in dataset:
+    sr = example.get("search_results", {})
+    contexts = sr.get("search_context", []) if sr else []
+    passage = next((ctx.strip() for ctx in contexts if isinstance(ctx, str) and ctx.strip()), example["question"])
+    corpus_passages.append(passage)
+
+print(f"Corpus size: {len(corpus_passages)}")  # Must be 17,944
+
+# Build BM25 index
+tokenised_corpus = [p.lower().split() for p in corpus_passages]
+bm25_index = BM25Okapi(tokenised_corpus)
+print("BM25 index built.")
+
+# Pre-compute all retrievals with progress tracking
+print("Retrieving passages...")
+retrieved_passages = []
+for i, example in enumerate(dataset):
+    tokens = example["question"].lower().split()
+    scores = bm25_index.get_scores(tokens)
+    best_idx = int(np.argmax(scores))
+    retrieved_passages.append(" ".join(corpus_passages[best_idx].split()[:300]))
+    if i % 2000 == 0:
+        print(f"  {i}/{len(dataset)} done")
+
+print(f"Done. Empty passages: {sum(1 for p in retrieved_passages if not p)}")  # Must be 0
+
+============================================================
+
+# Cell 38
+# All retrieval pre-computed in Cell 38. This cell does pure string
+# formatting only — no BM25 calls. Should finish in under 10 seconds.
+
+print("Preparing RAG prompts...")
+prompts_config3 = [
+    PROMPT_CONFIG_3.format(context=retrieved_passages[i], question=example["question"])
+    for i, example in enumerate(dataset)
+]
+
+print(f"Questions with no passage: {sum(1 for p in retrieved_passages if not p)}")  # Must be 0
+print(f"Total RAG prompts prepared: {len(prompts_config3)}")
+print(f"\nSample prompt:\n{prompts_config3[0][:400]}")
+
+============================================================
+
+# Cell 39
+# Section 16: Run Config 3 inference on 8B model.
+# prompts_config3 prepared in Cell 40. Results saved in Cell 41.
+
+import time
+
+print("Running Config 3 inference (8B model)...")
+start = time.time()
+results_config3_8b = run_inference(model, tokenizer, prompts_config3)
+elapsed = time.time() - start
+
+print(f"Inference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config3_8b[0]}")
+
+============================================================
+
+# Cell 40
+# Save Config 3 8B results and pre-computed retrieved passages
+with open('/content/drive/MyDrive/hallucination_project/results_config3_8b.json', 'w') as f:
+    json.dump(results_config3_8b, f)
+
+with open('/content/drive/MyDrive/hallucination_project/retrieved_passages.json', 'w') as f:
+    json.dump(retrieved_passages, f)
+
+print(f"Saved {len(results_config3_8b)} results to Google Drive")
+print(f"Saved {len(retrieved_passages)} retrieved passages to Google Drive")
+
+============================================================
+
+# Cell 42
+# Free 8B model from GPU memory before loading 3B model.
+
+import gc
+
+del model
+del tokenizer
+gc.collect()
+torch.cuda.empty_cache()
+print(f"GPU memory freed. Available: {torch.cuda.mem_get_info()[0]/1e9:.1f} GB")
+
+model_name = "meta-llama/Llama-3.2-3B-Instruct"
+
+print("\nLoading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
+
+print("Loading model...")
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+model.eval()
+print("3B model loaded successfully")
+print(f"Device: {next(model.parameters()).device}")
+
+============================================================
+
+# Cell 44
+# Repeat Config 3 with the smaller 3B model using the same
+# pre-prepared RAG prompts. Enables direct size comparison
+# of retrieval grounding effectiveness.
+
+print("Running Config 3 inference (3B model)...")
+start = time.time()
+results_config3_3b = run_inference(model, tokenizer, prompts_config3)
+elapsed = time.time() - start
+
+print(f"\nInference complete.")
+print(f"Time taken: {elapsed/60:.1f} minutes")
+print(f"Sample output: {results_config3_3b[0]}")
+
+============================================================
+
+# Cell 45
+# Save Config 3 3B results
+with open('/content/drive/MyDrive/hallucination_project/results_config3_3b.json', 'w') as f:
+    json.dump(results_config3_3b, f)
+
+print(f"Saved {len(results_config3_3b)} results to Google Drive")
+print("Path: /content/drive/MyDrive/hallucination_project/results_config3_3b.json")
+
+============================================================
+
+# Cell 46
+# Push all completed inference results to GitHub
+!cp "/content/drive/MyDrive/Colab Notebooks/hallucination_triviaqa.ipynb" /content/hallucination_triviaqa.ipynb
+!cp /content/drive/MyDrive/hallucination_project/*.json /content/
+!git add /content/hallucination_triviaqa.ipynb
+!git add /content/*.json
+!git commit -m "All 8 inference runs complete - Config 1,2,3,4 for 3B and 8B models"
+!git push origin main
+
+============================================================
+
+# Cell 48
+import json, os
+from google.colab import drive
+
+drive.mount('/content/drive', force_remount=True)
+
+BASE = "/content/drive/MyDrive/hallucination_project/"
+
+FILES = {
+    ("3B", "config1"): "results_config1_3b.json",
+    ("3B", "config2"): "results_config2_3b.json",
+    ("3B", "config3"): "results_config3_3b.json",
+    ("3B", "config4"): "results_config4_3b.json",
+    ("8B", "config1"): "results_config1_8b.json",
+    ("8B", "config2"): "results_config2_8b.json",
+    ("8B", "config3"): "results_config3_8b.json",
+    ("8B", "config4"): "results_config4_8b.json",
+}
+
+results = {}
+for (model, cfg), fname in FILES.items():
+    path = os.path.join(BASE, fname)
+    with open(path, "r") as f:
+        results.setdefault(model, {})[cfg] = json.load(f)
+    print(f"✓ {model} {cfg}: {len(results[model][cfg])} examples")
+
+# Also load passages used in Config 3
+with open(os.path.join(BASE, "passages_used.json"), "r") as f:
+    passages_used = json.load(f)
+print(f"✓ passages_used: {len(passages_used)} entries")
+
+print("\nAll results loaded. Access via: results['3B']['config1'][i]")
+
+============================================================
+
+# Cell 50
+# DEFINING EXTRACT ANSWER FUNCTION
+
+import re
+
+def extract_answer(raw_output, config):
+    if not isinstance(raw_output, str):
+        return ""
+
+    text = raw_output.strip()
+
+    # Config 4: strip confidence prefix e.g. "High Answer: X" or "Medium Answer: X. I am not certain."
+    if config == 4:
+        text = re.sub(r"^(High|Medium|Low)\s+Answer[:\-]?\s*", "", text, flags=re.IGNORECASE)
+        text = re.split(r"\.\s*(I am not certain|I'm not sure|I am unsure)", text, flags=re.IGNORECASE)[0]
+
+    # Take first line only, then first sentence
+    text = re.split(r"[\n\r]", text)[0]
+    text = re.split(r"(?<=[.!?])\s+", text)[0]
+    text = text.strip().rstrip(".")
+
+    # Normalise: lowercase, collapse whitespace
+    text = " ".join(text.lower().split())
+
+    return text
+
+
+def is_abstention(extracted):
+    abstention_phrases = [
+        "i don't know", "i do not know", "i'm not sure",
+        "i cannot answer", "i am unable", "i have no information",
+        "i don't have", "not sure", "unknown"
+    ]
+    return any(phrase in extracted for phrase in abstention_phrases)
+
+============================================================
+
+# Cell 51
+# Spot-check on a few raw outputs
+test_cases = [
+    (results["3B"]["config4"][0], 4),
+    (results["3B"]["config4"][1], 4),
+    (results["8B"]["config4"][0], 4),
+    (results["3B"]["config2"][0], 2),
+    (results["8B"]["config1"][0], 1),
+]
+
+for raw, cfg in test_cases:
+    extracted = extract_answer(raw, cfg)
+    print(f"CONFIG {cfg}")
+    print(f"  RAW:       {raw[:100]}")
+    print(f"  EXTRACTED: {extracted}")
+    print(f"  ABSTAINED: {is_abstention(extracted)}")
+    print()
+
+============================================================
+
+# Cell 53
+# Defining the EM and F1 Scoring Functions
+
+from collections import Counter
+
+def normalize(text):
+    """Lowercase, remove punctuation and extra whitespace."""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    text = " ".join(text.split())
+    return text
+
+def compute_em(predicted, aliases):
+    """
+    Exact match: 1 if predicted matches any alias, 0 otherwise.
+    aliases is the full list from dataset[i]['answer']['aliases'].
+    """
+    predicted_norm = normalize(predicted)
+    for alias in aliases:
+        if predicted_norm == normalize(alias):
+            return 1
+    return 0
+
+def compute_f1(predicted, aliases):
+    """
+    Token-level F1 against the best-matching alias.
+    """
+    predicted_tokens = normalize(predicted).split()
+    best_f1 = 0.0
+
+    for alias in aliases:
+        gold_tokens = normalize(alias).split()
+        common = Counter(predicted_tokens) & Counter(gold_tokens)
+        num_common = sum(common.values())
+
+        if num_common == 0:
+            continue
+
+        precision = num_common / len(predicted_tokens)
+        recall = num_common / len(gold_tokens)
+        f1 = 2 * precision * recall / (precision + recall)
+        best_f1 = max(best_f1, f1)
+
+    return best_f1
+
+============================================================
+
+# Cell 54
+# Spot check
+
+# Quick sanity check
+aliases = dataset[0]['answer']['aliases']
+pred = "ross bagdasarian"
+
+print(f"Question:  {dataset[0]['question']}")
+print(f"Predicted: {pred}")
+print(f"Aliases:   {aliases[:5]}")
+print(f"EM:        {compute_em(pred, aliases)}")
+print(f"F1:        {compute_f1(pred, aliases):.3f}")
+
+============================================================
+
+# Cell 55
+# checking whether Ross Bagdasarian was in the alias list.
+
+print(dataset[0]['answer']['aliases'])
+
+============================================================
+
+# Cell 57
+# Scoring all 8 Runs
+
+def score_run(raw_outputs, dataset, config):
+    """
+    Score a full run against TriviaQA gold aliases.
+    Returns a list of dicts, one per question.
+    """
+    scored = []
+    for i, raw in enumerate(raw_outputs):
+        aliases = dataset[i]['answer']['aliases']
+        extracted = extract_answer(raw, config)
+        abstained = is_abstention(extracted)
+        em = compute_em(extracted, aliases)
+        f1 = compute_f1(extracted, aliases)
+
+        scored.append({
+            "question":  dataset[i]['question'],
+            "gold":      dataset[i]['answer']['value'],
+            "aliases":   aliases,
+            "raw":       raw,
+            "extracted": extracted,
+            "abstained": abstained,
+            "em":        em,
+            "f1":        f1,
+        })
+    return scored
+
+
+# Score all 8 runs
+print("Scoring all 8 runs...")
+scored_results = {}
+for model in ["3B", "8B"]:
+    scored_results[model] = {}
+    for cfg in ["config1", "config2", "config3", "config4"]:
+        config_num = int(cfg[-1])
+        scored_results[model][cfg] = score_run(
+            results[model][cfg], dataset, config_num
+        )
+        em_mean  = sum(r["em"] for r in scored_results[model][cfg]) / 17944
+        f1_mean  = sum(r["f1"] for r in scored_results[model][cfg]) / 17944
+        print(f"✓ {model} {cfg} — EM: {em_mean:.3f}  F1: {f1_mean:.3f}")
+
+============================================================
+
+# Cell 58
+# Defining automatic hallucination labels
+
+def apply_hallucination_labels(scored, config):
+    """
+    Apply automatic hallucination labels to each result.
+
+    Labels:
+        Correct        — EM=1
+        Abstained      — model said I don't know
+        Hallucinated   — EM=0 AND F1 < 0.3 (and not abstained)
+        Uncertain      — EM=0 AND F1 >= 0.3 (partial match, not clearly hallucinated)
+        Confident-Wrong — Config 4 only: model expressed High confidence but EM=0
+    """
+    for r in scored:
+        if r["abstained"]:
+            r["label"] = "Abstained"
+        elif r["em"] == 1:
+            r["label"] = "Correct"
+        elif r["f1"] >= 0.3:
+            r["label"] = "Uncertain"
+        else:
+            if config == 4:
+                raw_lower = r["raw"].lower()
+                if raw_lower.startswith("high"):
+                    r["label"] = "Confident-Wrong"
+                else:
+                    r["label"] = "Hallucinated"
+            else:
+                r["label"] = "Hallucinated"
+    return scored
+
+
+# Apply labels to all 8 runs
+print("Applying hallucination labels...\n")
+for model in ["3B", "8B"]:
+    for cfg in ["config1", "config2", "config3", "config4"]:
+        config_num = int(cfg[-1])
+        scored_results[model][cfg] = apply_hallucination_labels(
+            scored_results[model][cfg], config_num
+        )
+        counts = Counter(r["label"] for r in scored_results[model][cfg])
+        total = 17944
+        print(f"{model} {cfg}:")
+        for label in ["Correct", "Hallucinated", "Abstained", "Uncertain", "Confident-Wrong"]:
+            n = counts.get(label, 0)
+            print(f"  {label:<20} {n:>6}  ({n/total*100:.1f}%)")
+        print()
+
+============================================================
+
+# Cell 59
+import json
+
+for model in ["3B", "8B"]:
+    for cfg in ["config1", "config2", "config3", "config4"]:
+        path = f"/content/drive/MyDrive/hallucination_project/scored_{cfg}_{model.lower()}.json"
+        with open(path, "w") as f:
+            json.dump(scored_results[model][cfg], f)
+        print(f"✓ Saved scored_{cfg}_{model.lower()}.json")
+
+print("\nAll scored results saved to Drive.")
+
+============================================================
+
+# Cell 60
+import os, json
+
+BASE = "/content/drive/MyDrive/hallucination_project/"
+
+FILES = {
+    ("3B", "config1"): "results_config1_3b.json",
+    ("3B", "config2"): "results_config2_3b.json",
+    ("3B", "config3"): "results_config3_3b.json",
+    ("3B", "config4"): "results_config4_3b.json",
+    ("8B", "config1"): "results_config1_8b.json",
+    ("8B", "config2"): "results_config2_8b.json",
+    ("8B", "config3"): "results_config3_8b.json",
+    ("8B", "config4"): "results_config4_8b.json",
+}
+
+for (model, cfg), fname in FILES.items():
+    path = os.path.join(BASE, fname)
+    size = os.path.getsize(path)
+    print(f"{model} {cfg}: {fname} — {size} bytes")
+
+============================================================
+
+# Cell 62
+# Building summary Report Table
+
+import pandas as pd
+
+rows = []
+for model in ["3B", "8B"]:
+    for cfg in ["config1", "config2", "config3", "config4"]:
+        scored = scored_results[model][cfg]
+        total = len(scored)
+        counts = Counter(r["label"] for r in scored)
+
+        em   = sum(r["em"] for r in scored) / total
+        f1   = sum(r["f1"] for r in scored) / total
+
+        rows.append({
+            "Model":           model,
+            "Config":          cfg,
+            "EM":              round(em, 3),
+            "F1":              round(f1, 3),
+            "Correct (%)":     round(counts.get("Correct", 0) / total * 100, 1),
+            "Hallucinated (%)":round(counts.get("Hallucinated", 0) / total * 100, 1),
+            "Abstained (%)":   round(counts.get("Abstained", 0) / total * 100, 1),
+            "Uncertain (%)":   round(counts.get("Uncertain", 0) / total * 100, 1),
+            "Confident-Wrong (%)": round(counts.get("Confident-Wrong", 0) / total * 100, 1),
+        })
+
+df_summary = pd.DataFrame(rows)
+print(df_summary.to_string(index=False))
+
+# Save to Drive
+df_summary.to_csv("/content/drive/MyDrive/hallucination_project/summary_results.csv", index=False)
+print("\nSaved summary_results.csv to Drive.")
+
+============================================================
+
+# Cell 64
+# Sampling 208 Cases for Manual Annotation
+
+import random
+random.seed(42)
+
+sample_rows = []
+
+for model in ["3B", "8B"]:
+    for cfg in ["config1", "config2", "config3", "config4"]:
+        scored = scored_results[model][cfg]
+
+        # Sample up to 6 Hallucinated, 3 Correct, 2 Uncertain per run
+        # Config 2: also sample Abstained, Config 4: also sample Confident-Wrong
+        buckets = {
+            "Hallucinated":    13,
+            "Correct":          7,
+            "Uncertain":        5,
+            "Abstained":        2 if cfg == "config2" else 0,
+            "Confident-Wrong":  2 if cfg == "config4" else 0,
+        }
+
+        for label, n in buckets.items():
+            pool = [r for r in scored if r["label"] == label]
+            sampled = random.sample(pool, min(n, len(pool)))
+            for r in sampled:
+                sample_rows.append({
+                    "model":     model,
+                    "config":    cfg,
+                    "question":  r["question"],
+                    "gold":      r["gold"],
+                    "extracted": r["extracted"],
+                    "raw":       r["raw"][:200],
+                    "em":        r["em"],
+                    "f1":        round(r["f1"], 3),
+                    "auto_label": r["label"],
+                    "manual_label": ""  # to be filled in manually
+                })
+
+df_sample = pd.DataFrame(sample_rows)
+print(f"Total sampled cases: {len(df_sample)}")
+print(df_sample["auto_label"].value_counts())
+
+# Save to Drive as CSV for manual annotation
+df_sample.to_csv("/content/drive/MyDrive/hallucination_project/manual_annotation_sample.csv", index=False)
+print("\nSaved manual_annotation_sample.csv to Drive.")
+
+============================================================
+
+# Cell 66
+# Loads the 208 manually annotated cases from Drive.
+# Computes agreement between automatic and manual labels.
+# Agreement rate shows how reliable the automatic rule is.
+# Disagreements are printed for qualitative error analysis.
+# =============================================================
+
+import pandas as pd
+
+# Load completed manual annotations (208 cases)
+df_manual = pd.read_excel("/content/drive/MyDrive/hallucination_project/manual_annotation_sample2_complete.xlsx")
+
+print(f"Total annotated cases: {len(df_manual)}")
+
+print(f"\nManual label distribution:")
+print(df_manual["manual_label"].value_counts())
+
+print(f"\nAuto label distribution:")
+print(df_manual["auto_label"].value_counts())
+
+# Agreement between auto and manual labels
+df_manual["agreement"] = df_manual["auto_label"] == df_manual["manual_label"]
+agreement_rate = df_manual["agreement"].mean()
+print(f"\nAuto vs Manual agreement rate: {agreement_rate:.1%}")
+
+# Where they disagree — used for error analysis in report
+disagree = df_manual[~df_manual["agreement"]][["model", "config", "question", "extracted", "gold", "auto_label", "manual_label"]]
+print(f"\nDisagreements: {len(disagree)}")
+print(disagree.to_string(index=False))
+
+# Save as CSV for use in downstream cells
+df_manual.to_csv("/content/drive/MyDrive/hallucination_project/manual_annotation_sample2_complete.csv", index=False)
+print("\nSaved as CSV to Drive.")
+
+============================================================
+
+# Cell 67
+# Compute manual label distribution per model and config
+print("Manual label distribution by model and config:\n")
+
+manual_rows = []
+for (model, cfg), group in df_manual.groupby(["model", "config"]):
+    total = len(group)
+    counts = group["manual_label"].value_counts()
+    manual_rows.append({
+        "Model":           model,
+        "Config":          cfg,
+        "n_sampled":       total,
+        "Correct (%)":     round(counts.get("Correct", 0) / total * 100, 1),
+        "Hallucinated (%)":round(counts.get("Hallucinated", 0) / total * 100, 1),
+        "Abstained (%)":   round(counts.get("Abstained", 0) / total * 100, 1),
+        "Uncertain (%)":   round(counts.get("Uncertain", 0) / total * 100, 1),
+    })
+
+df_manual_summary = pd.DataFrame(manual_rows)
+print(df_manual_summary.to_string(index=False))
+
+# Save
+df_manual_summary.to_csv("/content/drive/MyDrive/hallucination_project/manual_summary_2.csv", index=False)
+print("\nSaved manual_summary.csv to Drive.")
+
+============================================================
+
+# Cell 68
+# Compute auto vs manual disagreement by label type
+# Checks how reliable each automatic label is by comparing
+# it against 208 human-annotated cases.
+# Precision = how often the auto label matches the manual label.
+# Also shows what the manual labels actually were for each
+# auto category — reveals systematic failure modes.
+# These precision figures are used as correction factors to
+# estimate true hallucination rates across all 17,944 questions.
+
+print("Auto label precision and manual label breakdown:\n")
+
+for auto_lab in ["Hallucinated", "Correct", "Uncertain", "Abstained", "Confident-Wrong"]:
+    subset = df_manual[df_manual["auto_label"] == auto_lab]
+    if len(subset) == 0:
+        continue
+    agree = (subset["auto_label"] == subset["manual_label"]).sum()
+    breakdown = dict(subset["manual_label"].value_counts())
+    print(f"  Auto={auto_lab:<20} n={len(subset):3d}  "
+          f"precision={agree/len(subset):.3f}  "
+          f"→ manual breakdown: {breakdown}")
+
+print("\nKey finding: Auto=Uncertain has precision=0.075 — nearly all")
+print("Uncertain cases are actually Hallucinated per manual judgement.")
+print("Auto=Hallucinated has precision=0.865 — reliable when triggered.")
+
+============================================================
+
+# Cell 69
+# Applies manual-annotation-derived precision factors to
+# auto label counts across all 17,944 questions.
+# New factors from 208 cases:
+#   Hallucinated precision = 0.865
+#   Uncertain precision    = 0.075 (most Uncertain = Hallucinated)
+# Corrected rate = true positives from Hallucinated label
+#                + hallucinations hidden in Uncertain label
+
+precision_hallucinated = 0.865
+precision_uncertain = 0.075
+
+print(f"{'Model':<6} {'Config':<8} {'Auto Hall%':>10} {'Auto Unc%':>10} {'Corr Hall%':>12}")
+print("-" * 50)
+
+for model in ["3B", "8B"]:
+    for cfg in ["config1", "config2", "config3", "config4"]:
+        scored = scored_results[model][cfg]
+        n = len(scored)
+
+        n_hall = sum(1 for r in scored if r["label"] == "Hallucinated")
+        n_unc = sum(1 for r in scored if r["label"] == "Uncertain")
+
+        true_hall = (n_hall * precision_hallucinated) + (n_unc * (1 - precision_uncertain))
+        corr_rate = true_hall / n * 100
+
+        print(f"{model:<6} {cfg:<8} {n_hall/n*100:>10.1f} {n_unc/n*100:>10.1f} {corr_rate:>12.1f}")
+
+============================================================
+
+# Cell 71
+# Merge automatic and manual-corrected results into one final table
+
+# Precision factors derived from 208 manually annotated cases (Fix 2)
+# Auto=Hallucinated: 86.5% precise → reliable when triggered
+# Auto=Uncertain: 7.5% precise → almost entirely unreliable, mostly Hallucinated
+# Auto=Correct: 96.4% precise → very reliable
+# Auto=Abstained: 50.0% precise → unreliable
+# Corrected rate = (auto_hall × 0.865) + (auto_uncertain × 0.925)
+# The 0.925 for Uncertain = 1 - 0.075, capturing hallucinations hiding in that category
+
+HALLUCINATED_PRECISION = 0.865
+UNCERTAIN_PRECISION    = 0.075
+
+print("Final Results Table (Automatic + Manual-Corrected)\n")
+
+final_rows = []
+for model in ["3B", "8B"]:
+    for cfg in ["config1", "config2", "config3", "config4"]:
+        scored = scored_results[model][cfg]
+        total  = len(scored)
+        counts = Counter(r["label"] for r in scored)
+
+        em = sum(r["em"] for r in scored) / total
+        f1 = sum(r["f1"] for r in scored) / total
+
+        auto_hall     = counts.get("Hallucinated", 0)
+        auto_uncertain = counts.get("Uncertain", 0)
+
+        # Corrected hallucination estimate
+        # True hallucinations = confirmed hallucinations from Hallucinated bucket
+        #                     + hallucinations hiding in Uncertain bucket (1 - precision)
+        corrected_hall = (auto_hall * HALLUCINATED_PRECISION +
+                          auto_uncertain * (1 - UNCERTAIN_PRECISION))
+        corrected_hall_pct = round(corrected_hall / total * 100, 1)
+
+        final_rows.append({
+            "Model":                    model,
+            "Config":                   cfg,
+            "EM":                       round(em, 3),
+            "F1":                       round(f1, 3),
+            "Auto Hallucinated (%)":    round(auto_hall / total * 100, 1),
+            "Corrected Hallucinated (%)": corrected_hall_pct,
+            "Abstained (%)":            round(counts.get("Abstained", 0) / total * 100, 1),
+        })
+
+df_final = pd.DataFrame(final_rows)
+print(df_final.to_string(index=False))
+
+# Save
+df_final.to_csv("/content/drive/MyDrive/hallucination_project/final_results.csv", index=False)
+print("\nSaved final_results.csv to Drive.")
+
+============================================================
+
+# Cell 72
+# =============================================================
+# CONFIG 4 8B: Separating format collapse from hallucination
+# =============================================================
+# The 8B model under Config 4 has 22.5% unparseable outputs.
+# These get labelled Hallucinated by the auto rule because
+# the extractor returns empty string → EM=0, F1<0.3.
+# This cell quantifies how much of the 69.3% hallucination
+# rate is format collapse vs genuine factual error.
+# =============================================================
+
+scored_c4_8b = scored_results["8B"]["config4"]
+total = len(scored_c4_8b)
+
+# Unparseable = extracted answer is empty or just underscores
+unparseable = [r for r in scored_c4_8b
+               if not r["extracted"] or r["extracted"].strip().strip("_").strip() == ""]
+parseable = [r for r in scored_c4_8b if r not in unparseable]
+
+n_unparseable = len(unparseable)
+n_parseable = len(parseable)
+
+# Among parseable outputs only, compute hallucination rate
+hall_parseable = sum(1 for r in parseable if r["label"] == "Hallucinated")
+em_parseable = sum(r["em"] for r in parseable) / n_parseable
+
+print(f"8B Config 4 breakdown:")
+print(f"  Total:       {total}")
+print(f"  Unparseable: {n_unparseable} ({n_unparseable/total*100:.1f}%) ← format collapse")
+print(f"  Parseable:   {n_parseable} ({n_parseable/total*100:.1f}%)")
+print(f"\nAmong parseable outputs only:")
+print(f"  EM:                    {em_parseable:.3f}")
+print(f"  Auto Hallucinated:     {hall_parseable/n_parseable*100:.1f}%")
+print(f"\nConclusion: The 69.3% corrected hallucination rate conflates")
+print(f"format collapse ({n_unparseable/total*100:.1f}%) with genuine hallucination.")
+print(f"Among parseable outputs, hallucination rate is {hall_parseable/n_parseable*100:.1f}%.")
+
+============================================================
+
+# Cell 74
+import matplotlib.pyplot as plt
+import numpy as np
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+fig.suptitle("Hallucination in LLMs using TriviaQA — Key Results", fontsize=14, fontweight="bold")
+
+configs = ["config1", "config2", "config3", "config4"]
+config_labels = ["Config 1\nClosed-book", "Config 2\nAbstention", "Config 3\nRAG", "Config 4\nConfidence"]
+x = np.arange(len(configs))
+width = 0.35
+
+# Plot 1: Exact Match
+ax1 = axes[0]
+em_3b = [df_final[(df_final.Model=="3B") & (df_final.Config==c)]["EM"].values[0] for c in configs]
+em_8b = [df_final[(df_final.Model=="8B") & (df_final.Config==c)]["EM"].values[0] for c in configs]
+ax1.bar(x - width/2, em_3b, width, label="3B", color="#4C72B0")
+ax1.bar(x + width/2, em_8b, width, label="8B", color="#DD8452")
+ax1.set_title("Exact Match (EM)")
+ax1.set_xticks(x)
+ax1.set_xticklabels(config_labels, fontsize=9)
+ax1.set_ylim(0, 1)
+ax1.set_ylabel("EM Score")
+ax1.legend()
+
+# Plot 2: Token-level F1
+ax2 = axes[1]
+f1_3b = [df_final[(df_final.Model=="3B") & (df_final.Config==c)]["F1"].values[0] for c in configs]
+f1_8b = [df_final[(df_final.Model=="8B") & (df_final.Config==c)]["F1"].values[0] for c in configs]
+ax2.bar(x - width/2, f1_3b, width, label="3B", color="#4C72B0")
+ax2.bar(x + width/2, f1_8b, width, label="8B", color="#DD8452")
+ax2.set_title("Token-level F1")
+ax2.set_xticks(x)
+ax2.set_xticklabels(config_labels, fontsize=9)
+ax2.set_ylim(0, 1)
+ax2.set_ylabel("F1 Score")
+ax2.legend()
+
+# Plot 3: Corrected Hallucination Rate
+ax3 = axes[2]
+hall_3b = [df_final[(df_final.Model=="3B") & (df_final.Config==c)]["Corrected Hallucinated (%)"].values[0] for c in configs]
+hall_8b = [df_final[(df_final.Model=="8B") & (df_final.Config==c)]["Corrected Hallucinated (%)"].values[0] for c in configs]
+ax3.bar(x - width/2, hall_3b, width, label="3B", color="#4C72B0")
+ax3.bar(x + width/2, hall_8b, width, label="8B", color="#DD8452")
+ax3.set_title("Corrected Hallucination Rate (%)")
+ax3.set_xticks(x)
+ax3.set_xticklabels(config_labels, fontsize=9)
+ax3.set_ylabel("Hallucination Rate (%)")
+ax3.legend()
+
+plt.tight_layout()
+plt.savefig("/content/drive/MyDrive/hallucination_project/results_figure.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved results_figure.png to Drive.")
+
+============================================================
+
+# Cell 75
+from PIL import Image
+
+img = Image.open("/content/drive/MyDrive/hallucination_project/results_figure.png")
+img.save("/content/drive/MyDrive/hallucination_project/main_results.pdf", "PDF")
+print("Saved as PDF.")
+
+============================================================
+
+# Cell 77
+import os
+os.chdir("/content")
+
+!git config --global user.email "ibrahim.alqubaisi@city.ac.uk"
+!git config --global user.name "IQubaisi"
+
+# Check notebook exists locally
+import shutil
+src = "/content/drive/MyDrive/Colab Notebooks/hallucination_triviaqa.ipynb"
+dst = "/content/hallucination_triviaqa.ipynb"
+
+if os.path.exists(src):
+    shutil.copy(src, dst)
+    print("Notebook copied successfully")
+else:
+    print(f"ERROR: Notebook not found at {src}")
+    print("Files in Colab Notebooks folder:")
+    print(os.listdir("/content/drive/MyDrive/Colab Notebooks/"))
+
+============================================================
+
+# Cell 78
+if not os.path.exists("/content/.git"):
+    !git init
+    !git branch -m main
+
+!git add hallucination_triviaqa.ipynb
+!git commit -m "Final submission: all 5 fixes applied, 208 annotations, updated figures"
+
+from google.colab import userdata
+token = userdata.get('GITHUB_TOKEN')
+!git remote remove origin 2>/dev/null || true
+!git remote add origin https://IQubaisi:{token}@github.com/IQubaisi/hallucination-triviaqa.git
+!git push -u origin main --force
+
+============================================================
+
+# Cell 79
+import os
+os.chdir("/content")
+
+!git add final_results.csv
+!git add summary_results.csv
+!git add results_figure.png
+!git add manual_annotation_sample2_complete.xlsx
+!git add manual_summary_2.csv
+!git status
+
+============================================================
+
+# Cell 80
+!git commit -m "Add results files and manual annotations"
+
+from google.colab import userdata
+token = userdata.get('GITHUB_TOKEN')
+!git remote remove origin 2>/dev/null || true
+!git remote add origin https://IQubaisi:{token}@github.com/IQubaisi/hallucination-triviaqa.git
+!git push -u origin main --force
+
+============================================================
+
+# Cell 81
+import json
+
+with open('/content/drive/MyDrive/Colab Notebooks/hallucination_triviaqa.ipynb', 'r') as f:
+    nb = json.load(f)
+
+separator = '\n\n' + '='*60 + '\n\n'
+all_code = []
+for i, cell in enumerate(nb['cells']):
+    if cell['cell_type'] == 'code':
+        src = ''.join(cell['source']).strip()
+        if src:
+            all_code.append(f'# Cell {i}\n{src}')
+
+full_code = separator.join(all_code)
+
+with open('/content/drive/MyDrive/hallucination_project/all_code.txt', 'w') as f:
+    f.write(full_code)
+
+print(f"Done. Total code cells: {len(all_code)}")
+print(f"Total characters: {len(full_code)}")
